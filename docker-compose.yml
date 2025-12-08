@@ -5,7 +5,7 @@ services:
     build: .
     container_name: data_agent
     ports:
-      - "8501:8501"
+      - "8080:80"
     volumes:
       - ./data_lake:/app/data_lake # Persist the 'S3' storage
     environment:
