@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Expose Streamlit port
-EXPOSE 8501
+EXPOSE 80
 
 # Healthcheck to ensure container is responsive
 HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health || exit 1
