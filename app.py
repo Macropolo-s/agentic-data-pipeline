@@ -5,10 +5,38 @@ from engine import DataIngestor, StorageManager, SearchIndexer
 from agent import TransformationAgent
 import plotly.express as px
 import os
+from dotenv import load_dotenv
 
-# --- CONFIG ---
+# --- SAFE CONFIGURATION LOADER ---
+# 1. Load .env file (if it exists locally or in container)
+load_dotenv()
+
+def get_api_key():
+    """
+    Safely retrieves API Key from either:
+    1. System Environment (Render/Docker/.env) - PRIORITY
+    2. Streamlit Secrets (Local secrets.toml) - FALLBACK
+    3. Returns empty string if neither exists
+    """
+    # Check standard environment variable first (This works on Render)
+    key = os.environ.get("OPENAI_API_KEY")
+    if key:
+        return key
+    
+    # If not found, try Streamlit secrets (handling the missing file error)
+    try:
+        return st.secrets.get("OPENAI_API_KEY", "")
+    except FileNotFoundError:
+        # This catches the specific error you saw on Render
+        return ""
+    except Exception:
+        return ""
+
+# Set the environment variable safely for the rest of the app
+os.environ["OPENAI_API_KEY"] = get_api_key()
+
+# --- STREAMLIT SETUP ---
 st.set_page_config(page_title="Agentic Data Foundry", layout="wide", page_icon="⚡")
-os.environ["OPENAI_API_KEY"] = st.secrets.get("OPENAI_API_KEY", "") # Or input in UI
 
 # --- STATE MANAGEMENT ---
 if 'data_state' not in st.session_state:
@@ -17,6 +45,8 @@ if 'current_step' not in st.session_state:
     st.session_state['current_step'] = 0
 if 'logs' not in st.session_state:
     st.session_state['logs'] = []
+if 'dataset_name' not in st.session_state:
+    st.session_state['dataset_name'] = "dataset"
 
 def log(message):
     st.session_state['logs'].append(f"[{time.strftime('%H:%M:%S')}] {message}")
@@ -40,6 +70,7 @@ with st.sidebar:
             
     st.markdown("---")
     st.write("## 📝 System Logs")
+    # Show last 10 logs
     for msg in st.session_state['logs'][-10:]:
         st.text_area("Log", msg, height=2, label_visibility="collapsed", disabled=True)
 
@@ -56,13 +87,17 @@ if st.session_state['current_step'] == 0:
         file_type = uploaded_file.name.split('.')[-1]
         if st.button("🚀 Ingest Data"):
             with st.spinner("Agent analyzing file structure..."):
-                ingestor = DataIngestor()
-                df = ingestor.read_file(uploaded_file, file_type)
-                st.session_state['data_state'] = df
-                st.session_state['dataset_name'] = uploaded_file.name.split('.')[0]
-                log(f"Ingested {len(df)} rows from {uploaded_file.name}")
-                st.session_state['current_step'] = 1
-                st.rerun()
+                try:
+                    ingestor = DataIngestor()
+                    df = ingestor.read_file(uploaded_file, file_type)
+                    st.session_state['data_state'] = df
+                    st.session_state['dataset_name'] = uploaded_file.name.split('.')[0]
+                    log(f"Ingested {len(df)} rows from {uploaded_file.name}")
+                    st.session_state['current_step'] = 1
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Ingestion failed: {e}")
+                    log(f"Error: {e}")
 
 # 2. STORAGE
 elif st.session_state['current_step'] == 1:
@@ -97,11 +132,14 @@ elif st.session_state['current_step'] == 2:
         with st.spinner("Embedding vectors (ChromaDB)..."):
             indexer = SearchIndexer()
             # Ensure data is string for indexing
-            indexer.index_data(df, "demo_collection", index_col)
-            log(f"Vector index built on column: {index_col}")
-            st.session_state['index_col'] = index_col
-            st.session_state['current_step'] = 3
-            st.rerun()
+            try:
+                indexer.index_data(df, "demo_collection", index_col)
+                log(f"Vector index built on column: {index_col}")
+                st.session_state['index_col'] = index_col
+                st.session_state['current_step'] = 3
+                st.rerun()
+            except Exception as e:
+                st.error(f"Indexing failed: {e}")
 
 # 4. STAGING & SEARCH
 elif st.session_state['current_step'] == 3:
@@ -118,17 +156,28 @@ elif st.session_state['current_step'] == 3:
     with tab2:
         query = st.text_input("Ask a question or search by concept (e.g., 'high value transactions')")
         if query:
-            indexer = SearchIndexer()
-            results = indexer.search(query, "demo_collection")
-            
-            st.write("### Research Results")
-            # Display results in a readable way
-            for i, doc in enumerate(results['documents'][0]):
-                st.info(f"Result {i+1}: {doc}")
+            try:
+                indexer = SearchIndexer()
+                results = indexer.search(query, "demo_collection")
+                
+                st.write("### Research Results")
+                # Display results in a readable way
+                if results and 'documents' in results and results['documents']:
+                    for i, doc in enumerate(results['documents'][0]):
+                        st.info(f"Result {i+1}: {doc}")
+                else:
+                    st.warning("No matches found.")
+            except Exception as e:
+                st.error(f"Search failed: {e}")
 
 # 5. TRANSFORMATION
 elif st.session_state['current_step'] == 4:
     st.header("Step 5: Agentic Transformation (Business Rules)")
+    
+    # Check if API Key is available
+    has_key = bool(os.environ.get("OPENAI_API_KEY"))
+    if not has_key:
+        st.warning("⚠️ No OpenAI API Key found. The Agent will run in 'Manual Fallback Mode'.")
     
     agent = TransformationAgent(api_key=os.environ.get("OPENAI_API_KEY"))
     rules_dict = agent.get_rule_dictionary()
@@ -150,15 +199,16 @@ elif st.session_state['current_step'] == 4:
             
         if st.button("⚡ Execute Agent Job"):
             with st.spinner("Agent generating transformation code..."):
-                # Pass data_state to agent
-                df = st.session_state['data_state']
-                # Mocking the AI agent application for visual stability if no key
-                # In real prod, this calls OpenAI to generate Pandas/SQL
-                new_df = agent.apply_business_rule(df, rule_input, selected_rule)
-                
-                st.session_state['data_state'] = new_df
-                log(f"Applied rule: {selected_rule}")
-                st.success("Transformation Complete!")
+                try:
+                    # Pass data_state to agent
+                    df = st.session_state['data_state']
+                    new_df = agent.apply_business_rule(df, rule_input, selected_rule)
+                    
+                    st.session_state['data_state'] = new_df
+                    log(f"Applied rule: {selected_rule}")
+                    st.success("Transformation Complete!")
+                except Exception as e:
+                    st.error(f"Transformation failed: {e}")
     
     st.write("### Preview Result")
     st.dataframe(st.session_state['data_state'].head(10), use_container_width=True)
@@ -177,24 +227,28 @@ elif st.session_state['current_step'] == 5:
     
     with tab1:
         st.caption("GET /api/v1/data/latest")
-        st.json(st.session_state['data_state'].head(5).to_dict(orient='records'))
+        if st.session_state['data_state'] is not None:
+            st.json(st.session_state['data_state'].head(5).to_dict(orient='records'))
         
     with tab2:
         df = st.session_state['data_state']
-        numeric_cols = df.select_dtypes(include=['float', 'int']).columns
-        if len(numeric_cols) > 0:
-            x_axis = st.selectbox("X Axis", df.columns)
-            y_axis = st.selectbox("Y Axis", numeric_cols)
-            fig = px.bar(df, x=x_axis, y=y_axis, title="Data Visualization")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.warning("No numeric data for visualization.")
+        if df is not None:
+            numeric_cols = df.select_dtypes(include=['float', 'int']).columns
+            if len(numeric_cols) > 0:
+                x_axis = st.selectbox("X Axis", df.columns)
+                y_axis = st.selectbox("Y Axis", numeric_cols)
+                fig = px.bar(df, x=x_axis, y=y_axis, title="Data Visualization")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("No numeric data for visualization.")
             
     with tab3:
-        csv = st.session_state['data_state'].to_csv(index=False).encode('utf-8')
-        st.download_button("Download Processed CSV", csv, "processed_data.csv", "text/csv")
+        if st.session_state['data_state'] is not None:
+            csv = st.session_state['data_state'].to_csv(index=False).encode('utf-8')
+            st.download_button("Download Processed CSV", csv, "processed_data.csv", "text/csv")
     
     if st.button("🔄 Start New Pipeline"):
         st.session_state['current_step'] = 0
         st.session_state['data_state'] = None
         st.rerun()
+
